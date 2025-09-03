@@ -16,12 +16,13 @@ NO_SELECTION_MSG = "Please select a template first!"
 DELETE_NO_SELECTION_MSG = "Please select a template to delete!"
 NO_SELECTION_TITLE = "No Selection"
 
+
 class EmailThread(QThread):
     """Thread for sending emails to prevent GUI freezing"""
     progress = pyqtSignal(int)
     log_signal = pyqtSignal(str)
     finished = pyqtSignal(list)
-    
+
     def __init__(self, smtp_config, recipients, subject, body, attachments):
         super().__init__()
         self.smtp_config = smtp_config
@@ -29,7 +30,7 @@ class EmailThread(QThread):
         self.subject = subject
         self.body = body
         self.attachments = attachments
-    
+
     def run(self):
         logs = []
         total = len(self.recipients)
@@ -39,13 +40,13 @@ class EmailThread(QThread):
             status = "Sent" if success else f"Failed: {error}"
             log_entry = {'timestamp': timestamp, 'recipient': recipient, 'status': status}
             logs.append(log_entry)
-            
+
             self.progress.emit(int((i + 1) / total * 100))
             self.log_signal.emit(f"{timestamp} - {recipient} - {status}")
-            
+
             # Throttle
             time.sleep(random.uniform(2, 5))
-            
+
             # Retry if failed
             if not success:
                 time.sleep(random.uniform(1, 3))
@@ -55,8 +56,22 @@ class EmailThread(QThread):
                 log_entry = {'timestamp': timestamp, 'recipient': recipient, 'status': status}
                 logs.append(log_entry)
                 self.log_signal.emit(f"{timestamp} - {recipient} - {status}")
-        
+
         self.finished.emit(logs)
+
+
+class SmtpValidateThread(QThread):
+    """Thread to validate SMTP config without blocking the GUI"""
+    result = pyqtSignal(bool, str)
+
+    def __init__(self, smtp_config):
+        super().__init__()
+        self.smtp_config = smtp_config
+
+    def run(self):
+        valid, message = backend.validate_smtp_config(self.smtp_config)
+        self.result.emit(valid, message)
+
 
 class EmailApp(QMainWindow):
     def __init__(self):
@@ -128,7 +143,7 @@ class EmailApp(QMainWindow):
 
         toggle_container = QWidget()
         toggle_layout = QHBoxLayout()
-        toggle_layout.setContentsMargins(0,0,10,0)
+        toggle_layout.setContentsMargins(0, 0, 10, 0)
         toggle_container.setLayout(toggle_layout)
 
         toggle_btn = QPushButton("Dark / Light Mode")
@@ -154,11 +169,11 @@ class EmailApp(QMainWindow):
         labels = ["SMTP Server:", "Port:", "Email:", "Password:"]
         self.entries = []
         for i, text in enumerate(labels):
-            smtp_layout.addWidget(QLabel(text), i//2, (i%2)*2)
+            smtp_layout.addWidget(QLabel(text), i // 2, (i % 2) * 2)
             entry = QLineEdit()
             if "Password" in text:
                 entry.setEchoMode(QLineEdit.EchoMode.Password)
-            smtp_layout.addWidget(entry, i//2, (i%2)*2+1)
+            smtp_layout.addWidget(entry, i // 2, (i % 2) * 2 + 1)
             self.entries.append(entry)
 
         self.entry_server, self.entry_port, self.entry_email, self.entry_password = self.entries
@@ -166,7 +181,7 @@ class EmailApp(QMainWindow):
         # Set some default values for testing
         self.entry_server.setText("smtp.gmail.com")
         self.entry_port.setText("587")
-        
+
         btn_validate_smtp = QPushButton("Validate SMTP Configuration")
         btn_validate_smtp.clicked.connect(self.validate_smtp)
         smtp_layout.addWidget(btn_validate_smtp, 2, 0, 1, 2)
@@ -191,11 +206,11 @@ class EmailApp(QMainWindow):
         btn_remove = QPushButton("Remove Selected")
         btn_remove.clicked.connect(self.remove_selected)
         rec_layout.addWidget(btn_remove)
-        
+
         btn_clear_all = QPushButton("Clear All")
         btn_clear_all.clicked.connect(self.clear_all_emails)
         rec_layout.addWidget(btn_clear_all)
-        
+
         rec_layout.addStretch()
 
         # Email Editor + Preview
@@ -340,34 +355,53 @@ class EmailApp(QMainWindow):
     def log(self, msg):
         self.text_logs.append(msg)
 
+    # ---------- Updated: non-blocking validate ----------
     def validate_smtp(self):
-        """Validate SMTP configuration"""
+        """Validate SMTP configuration (non-blocking)."""
         smtp_config = {
             "server": self.entry_server.text(),
             "port": int(self.entry_port.text()) if self.entry_port.text().isdigit() else 587,
             "email": self.entry_email.text(),
             "password": self.entry_password.text(),
-            "tls": True
+            # decide SSL vs TLS from port; user may change
+            "ssl": self.entry_port.text() == "465",
+            "tls": self.entry_port.text() != "465"
         }
-        
-        valid, message = backend.validate_smtp_config(smtp_config)
+
+        # run validation on background thread
+        self.validate_thread = SmtpValidateThread(smtp_config)
+        self.validate_thread.result.connect(self.on_validate_done)
+        # disable cursor / button for UX
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        sender = self.sender()
+        if isinstance(sender, QPushButton):
+            sender.setEnabled(False)
+        # restore states when finished
+        def _cleanup():
+            QApplication.restoreOverrideCursor()
+            if isinstance(sender, QPushButton):
+                sender.setEnabled(True)
+        self.validate_thread.finished.connect(_cleanup)
+        self.validate_thread.start()
+
+    def on_validate_done(self, valid, message):
         if valid:
             QMessageBox.information(self, "SMTP Valid", message)
         else:
             QMessageBox.warning(self, "SMTP Invalid", message)
 
     def load_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load CSV/TXT", "", "CSV Files (*.csv);;Text Files (*.txt)")
+        path, _ = QFileDialog.getOpenFileName(self, "Load CSV/TXT", "", "CSV Files (*.csv);Text Files (*.txt)")
         if path:
             try:
                 count = backend.count_emails_in_file(path)
                 if count == 0:
                     QMessageBox.warning(self, "No Valid Emails", "The selected file contains no valid email addresses.")
                     return
-                
-                if QMessageBox.question(self, "Confirm Load", 
-                                       f"Found {count} valid emails. Load them?",
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+
+                if QMessageBox.question(self, "Confirm Load",
+                                        f"Found {count} valid emails. Load them?",
+                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
                     emails = backend.load_emails(path)
                     self.list_emails.clear()
                     self.list_emails.addItems(emails)
@@ -381,9 +415,9 @@ class EmailApp(QMainWindow):
 
     def clear_all_emails(self):
         if self.list_emails.count() > 0:
-            if QMessageBox.question(self, "Confirm Clear", 
-                                   "Clear all recipients?",
-                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            if QMessageBox.question(self, "Confirm Clear",
+                                    "Clear all recipients?",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
                 self.list_emails.clear()
 
     def add_attachment(self):
@@ -412,49 +446,74 @@ class EmailApp(QMainWindow):
         html_content = self.text_temp_body.toHtml()
         self.preview_temp_body.setHtml(html_content)
 
+    # ---------- send flow: validate off-thread then start EmailThread ----------
     def send_email(self):
         recipients = [self.list_emails.item(i).text() for i in range(self.list_emails.count())]
         if not recipients:
             QMessageBox.warning(self, "No Recipients", "Load recipient emails first!")
             return
-        
-        # Validate SMTP configuration
+
+        subject = self.entry_subject.text()
+        if not subject.strip():
+            QMessageBox.warning(self, "No Subject", "Please enter an email subject!")
+            return
+
+        body = self.text_body.toHtml()
+        if not body.strip():
+            QMessageBox.warning(self, "No Body", "Please enter email content!")
+            return
+
+        # Prepare SMTP config
         smtp_config = {
             "server": self.entry_server.text(),
             "port": int(self.entry_port.text()) if self.entry_port.text().isdigit() else 587,
             "email": self.entry_email.text(),
             "password": self.entry_password.text(),
-            "tls": True
+            "ssl": self.entry_port.text() == "465",
+            "tls": self.entry_port.text() != "465"
         }
-        
-        valid, message = backend.validate_smtp_config(smtp_config)
+
+        # Validate first BUT non-blocking: use SmtpValidateThread then continue in callback
+        self._pending_send = {
+            "smtp_config": smtp_config,
+            "recipients": recipients,
+            "subject": subject,
+            "body": body,
+            "attachments": list(self.attachments)
+        }
+
+        # Disable UI controls while validating
+        self.findChild(QPushButton, "primary").setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        self.validate_thread2 = SmtpValidateThread(smtp_config)
+        self.validate_thread2.result.connect(self._on_validate_before_send)
+        # cleanup UI once validation attempt finishes
+        self.validate_thread2.finished.connect(lambda: (
+            QApplication.restoreOverrideCursor(),
+        ))
+        self.validate_thread2.start()
+
+    def _on_validate_before_send(self, valid, message):
         if not valid:
             QMessageBox.warning(self, "SMTP Invalid", f"Cannot send emails: {message}")
+            self.findChild(QPushButton, "primary").setEnabled(True)
             return
-        
-        subject = self.entry_subject.text()
-        if not subject.strip():
-            QMessageBox.warning(self, "No Subject", "Please enter an email subject!")
-            return
-        
-        body = self.text_body.toHtml()
-        if not body.strip():
-            QMessageBox.warning(self, "No Body", "Please enter email content!")
-            return
-        
-        # Start email sending thread
+
+        # Proceed to start EmailThread
+        pending = self._pending_send
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.findChild(QPushButton, "primary").setEnabled(False)
         self.findChild(QPushButton, "danger").setVisible(True)
-        
-        self.email_thread = EmailThread(smtp_config, recipients, subject, body, self.attachments)
+
+        self.email_thread = EmailThread(pending["smtp_config"], pending["recipients"], pending["subject"], pending["body"], pending["attachments"])
         self.email_thread.progress.connect(self.progress_bar.setValue)
         self.email_thread.log_signal.connect(self.log)
         self.email_thread.finished.connect(self.on_email_finished)
         self.email_thread.start()
-        
-        self.log("Started sending emails...")
+
+        self.log("Started sending emails.")
 
     def stop_sending(self):
         if self.email_thread and self.email_thread.isRunning():
@@ -476,7 +535,7 @@ class EmailApp(QMainWindow):
         if not self.current_logs:
             QMessageBox.warning(self, "No Logs", "There are no logs to export.")
             return
-        
+
         path, _ = QFileDialog.getSaveFileName(self, "Export Logs", "", "CSV Files (*.csv)")
         if path:
             if backend.export_logs_to_csv(self.current_logs, path):
@@ -496,7 +555,7 @@ class EmailApp(QMainWindow):
         if not selected:
             QMessageBox.warning(self, NO_SELECTION_TITLE, NO_SELECTION_MSG)
             return
-        
+
         name = selected[0].text()
         template = backend.get_template_by_name(name)
         if template:
@@ -513,7 +572,7 @@ class EmailApp(QMainWindow):
         if not selected:
             QMessageBox.warning(self, NO_SELECTION_TITLE, NO_SELECTION_MSG)
             return
-        
+
         name = selected[0].text()
         template = backend.get_template_by_name(name)
         if template:
@@ -529,17 +588,17 @@ class EmailApp(QMainWindow):
         name, ok = QFileDialog.getSaveFileName(self, "Save Template As", "", "JSON (*.json)")
         if not name or not ok:
             return
-        
+
         if not name.endswith('.json'):
             name += '.json'
-            
+
         success = backend.save_template(
-            name, 
-            self.entry_temp_subject.text(), 
-            self.text_temp_body.toHtml(), 
+            name,
+            self.entry_temp_subject.text(),
+            self.text_temp_body.toHtml(),
             self.template_attachments
         )
-        
+
         if success:
             self.refresh_templates()
             self.log(f"Template saved as '{os.path.basename(name)}'")
@@ -551,11 +610,11 @@ class EmailApp(QMainWindow):
         if not selected:
             QMessageBox.warning(self, NO_SELECTION_TITLE, DELETE_NO_SELECTION_MSG)
             return
-        
+
         name = selected[0].text()
-        if QMessageBox.question(self, "Confirm Delete", 
-                               f"Delete template '{name}'?",
-                               QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, "Confirm Delete",
+                                f"Delete template '{name}'?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             if backend.delete_template(name):
                 self.refresh_templates()
                 self.log(f"Deleted template '{name}'")
@@ -567,6 +626,7 @@ class EmailApp(QMainWindow):
         if files:
             self.template_attachments.extend(files)
             self.log(f"Added {len(files)} template attachments/images.")
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
